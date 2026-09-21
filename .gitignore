@@ -1,0 +1,18 @@
+# Runtime config — contains secrets (tokens/oauth). Never commit.
+config.json
+language_constrainer.json
+.env
+.env.local
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.install
+
+# Databases / logs
+*.db
+*.log
+
+# macOS
+.DS_Store
+__pycache__/

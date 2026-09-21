@@ -1,0 +1,34 @@
+{
+  "name": "language-constrainer",
+  "description": "constrains chat to a target language; out-of-language messages are held for audit (a moderator must approve/reject them)",
+  "version": "0.1.0",
+  "capabilities": "preprocess",
+  "root_file": "./src/main.rs",
+  "launch_command": "cargo run",
+  "command_flags": [
+    "--release"
+  ],
+  "autostart": false,
+  "binary": {
+    "macos": {
+      "x86_64": "target/release/language_constrainer_rs",
+      "aarch64": "target/release/language_constrainer_rs",
+      "arm": "target/release/language_constrainer_rs"
+    },
+    "linux": {
+      "x86_64": "target/release/language_constrainer_rs",
+      "aarch64": "target/release/language_constrainer_rs",
+      "arm": "target/release/language_constrainer_rs"
+    },
+    "windows": {
+      "x86_64": "target/release/language_constrainer_rs.exe",
+      "aarch64": "target/release/language_constrainer_rs.exe",
+      "arm": "target/release/language_constrainer_rs.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ]
+}
