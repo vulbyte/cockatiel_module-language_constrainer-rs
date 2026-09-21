@@ -15,4 +15,4 @@ Cargo.lock.install
 
 # macOS
 .DS_Store
-__pycache__/
+__pycache__//Cargo.lock
