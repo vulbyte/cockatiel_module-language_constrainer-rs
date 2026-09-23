@@ -178,6 +178,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         match container.payload {
+            Some(Payload::AuthVerify(_)) => {
+                // Answer the engine's liveness probe (this module reads the
+                // socket directly, so the client's auto-answer is bypassed).
+                let reply = Container {
+                    version: 1,
+                    auth_token: auth_token.clone(),
+                    module_name: module_name.clone(),
+                    module_instance_uuid7: instance_uuid.clone(),
+                    payload: Some(Payload::AuthVerify(AuthVerify {
+                        cur_auth: auth_token.clone(),
+                    })),
+                };
+                let mut buf = Vec::new();
+                if reply.encode(&mut buf).is_ok() {
+                    let _ = write.send(WsMessage::Binary(buf.into())).await;
+                }
+            }
             Some(Payload::MessagePreProcess(pre)) => {
                 let Some(chat) = &pre.raw_message else {
                     continue;
