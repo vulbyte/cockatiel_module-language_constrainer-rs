@@ -124,6 +124,24 @@ fn violates_language(
     false
 }
 
+/// Build the ChatMessageRejected record so the engine logs the rejection
+/// clearly (reason + original raw message + what it became).
+fn compose_rejected(
+    message_uuid7: &str,
+    chat: &ChatMessage,
+    processed: &str,
+    reason: &str,
+    origin: &str,
+) -> ChatMessageRejected {
+    ChatMessageRejected {
+        message_uuid7: message_uuid7.to_string(),
+        message: Some(chat.clone()),
+        processed_message: processed.to_string(),
+        reason: reason.to_string(),
+        origin: origin.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -194,6 +212,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if flag.encode(&mut buf).is_ok() {
                         let _ = write.send(WsMessage::Binary(buf.into())).await;
                     }
+                    // Also record the rejection clearly (raw + reason), like the
+                    // banned-words module — the engine logs + persists it as a
+                    // searchable `chat_rejected` timeline record.
+                    let reason = format!("violates language '{}'", config.language);
+                    let rej = compose_rejected(&uuid, chat, &original, &reason, &module_name);
+                    let rej = Container {
+                        version: 1,
+                        auth_token: auth_token.clone(),
+                        module_name: module_name.clone(),
+                        module_instance_uuid7: instance_uuid.clone(),
+                        payload: Some(Payload::ChatMessageRejected(rej)),
+                    };
+                    let mut buf = Vec::new();
+                    if rej.encode(&mut buf).is_ok() {
+                        let _ = write.send(WsMessage::Binary(buf.into())).await;
+                    }
                 }
 
                 // Ack pre_process (content preserved — the audit hold prevents
@@ -234,6 +268,25 @@ mod tests {
     use super::*;
 
     const LATIN: [[u32; 2]; 1] = [[0x41, 0x5A]]; // A-Z only
+
+    #[test]
+    fn compose_rejected_carries_reason_raw_origin() {
+        let chat = ChatMessage {
+            platform: "twitch".into(),
+            raw_data: vec![],
+            raw_message: "Привет".into(),
+            user_uuid7: "u1".into(),
+            command: None,
+            user_data: None,
+            channel_id: "chan".into(),
+        };
+        let rej = compose_rejected("uuid-9", &chat, "Привет", "violates language 'latin'", "language-constrainer");
+        assert_eq!(rej.message_uuid7, "uuid-9");
+        assert_eq!(rej.origin, "language-constrainer");
+        assert_eq!(rej.reason, "violates language 'latin'");
+        assert_eq!(rej.processed_message, "Привет");
+        assert_eq!(rej.message.unwrap().raw_message, "Привет");
+    }
 
     #[test]
     fn ascii_uppercase_pass() {
