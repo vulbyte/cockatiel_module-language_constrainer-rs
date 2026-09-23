@@ -228,3 +228,46 @@ audio: Vec::new(),
 
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LATIN: [[u32; 2]; 1] = [[0x41, 0x5A]]; // A-Z only
+
+    #[test]
+    fn ascii_uppercase_pass() {
+        assert!(!violates_language("HELLO", &LATIN, false, false));
+        assert!(!violates_language("HELLO WORLD", &LATIN, false, false));
+    }
+
+    #[test]
+    fn lowercase_fails_outside_range() {
+        assert!(violates_language("hello", &LATIN, false, false));
+    }
+
+    #[test]
+    fn non_latin_fails() {
+        assert!(violates_language("привет", &LATIN, false, false));
+        assert!(violates_language("HÉLLO", &LATIN, false, false));
+    }
+
+    #[test]
+    fn emoji_gated_by_flag() {
+        assert!(violates_language("HELLO 👍", &LATIN, false, false));
+        assert!(!violates_language("HELLO 👍", &LATIN, true, false));
+    }
+
+    #[test]
+    fn expressive_gated_by_flag() {
+        assert!(violates_language("HELLO ඞ", &LATIN, false, false));
+        assert!(!violates_language("HELLO ඞ", &LATIN, false, true));
+    }
+
+    #[test]
+    fn ranges_match() {
+        assert!(in_ranges('A', &LATIN));
+        assert!(in_ranges('Z', &LATIN));
+        assert!(!in_ranges('a', &LATIN));
+        assert!(!in_ranges('1', &LATIN));
+    }
+}
