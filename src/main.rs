@@ -21,6 +21,8 @@ struct Config {
     allow_expressive: bool,
     #[serde(default = "default_reason")]
     flag_reason: String,
+    #[serde(default = "default_expressive_chars")]
+    expressive_chars: Vec<String>,
 }
 
 fn default_language() -> String {
@@ -31,23 +33,74 @@ fn default_reason() -> String {
     "out-of-language".to_string()
 }
 
-fn load_config() -> Config {
-    std::fs::read_to_string("config.json")
+fn default_expressive_chars() -> Vec<String> {
+    vec![
+        "ඞ".to_string(),
+        "๑".to_string(),
+        "ᴗ".to_string(),
+        "ಠ".to_string(),
+        "益".to_string(),
+        "ʕ".to_string(),
+        "ʔ".to_string(),
+        "⊙".to_string(),
+        "☉".to_string(),
+        "♥".to_string(),
+        "♡".to_string(),
+        "✧".to_string(),
+        "❀".to_string(),
+        "★".to_string(),
+        "☆".to_string(),
+    ]
+}
+
+fn default_config() -> Config {
+    Config {
+        language: default_language(),
+        custom_ranges: Vec::new(),
+        allow_emoji: false,
+        allow_expressive: false,
+        flag_reason: default_reason(),
+        expressive_chars: default_expressive_chars(),
+    }
+}
+
+/// Read the Config from config.json, preferring the `module_specific` object
+/// (the house convention for module settings) and falling back to the legacy
+/// top-level layout so pre-existing configs keep working.
+fn read_config_from_file() -> Option<Config> {
+    let s = std::fs::read_to_string("config.json").ok()?;
+    let root: serde_json::Value = serde_json::from_str(&s).ok()?;
+    match root.get("module_specific") {
+        Some(ms) if ms.is_object() => serde_json::from_value::<Config>(ms.clone()).ok(),
+        _ => serde_json::from_str::<Config>(&s).ok(),
+    }
+}
+
+/// Save the Config into the `module_specific` object of config.json, merging
+/// with (and preserving) any existing top-level fields.
+fn save_config(config: &Config) {
+    let mut root: serde_json::Value = std::fs::read_to_string("config.json")
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| {
-            let default = Config {
-                language: default_language(),
-                custom_ranges: Vec::new(),
-                allow_emoji: false,
-                allow_expressive: false,
-                flag_reason: default_reason(),
-            };
-            if let Ok(pretty) = serde_json::to_string_pretty(&default) {
-                let _ = std::fs::write("config.json", pretty);
-            }
-            default
-        })
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    root["module_specific"] = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
+    if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write("config.json", pretty);
+    }
+}
+
+fn load_config() -> Config {
+    if let Some(cfg) = read_config_from_file() {
+        // A legacy top-level config is migrated into module_specific here so
+        // it stays in sync with the house layout.
+        save_config(&cfg);
+        return cfg;
+    }
+    // No saved config (or an unreadable one): create defaults and backfill
+    // them into module_specific so the settings always exist.
+    let cfg = default_config();
+    save_config(&cfg);
+    cfg
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,25 +130,10 @@ fn is_emoji(c: char) -> bool {
         || (0x1F000..=0x1F0FF).contains(&cp)
 }
 
-/// Characters commonly used for expressive/emote messages (e.g. ඞ, (๑ > ᴗ < ๑)).
-fn is_expressive(c: char) -> bool {
-    matches!(
-        c,
-        'ඞ' | '๑'
-            | 'ᴗ'
-            | 'ಠ'
-            | '益'
-            | 'ʕ'
-            | 'ʔ'
-            | '⊙'
-            | '☉'
-            | '♥'
-            | '♡'
-            | '✧'
-            | '❀'
-            | '★'
-            | '☆'
-    )
+/// Characters commonly used for expressive/emote messages (e.g. ඞ, (๑ > ᴗ < ๑)),
+/// read from config (defaults to the curated list) so operators can extend it.
+fn is_expressive(c: char, expressive_chars: &[String]) -> bool {
+    expressive_chars.iter().any(|s| s.starts_with(c))
 }
 
 fn in_ranges(c: char, ranges: &[[u32; 2]]) -> bool {
@@ -108,6 +146,7 @@ fn violates_language(
     ranges: &[[u32; 2]],
     allow_emoji: bool,
     allow_expressive: bool,
+    expressive_chars: &[String],
 ) -> bool {
     for c in message.chars() {
         if c.is_whitespace() || in_ranges(c, ranges) {
@@ -116,7 +155,7 @@ fn violates_language(
         if allow_emoji && is_emoji(c) {
             continue;
         }
-        if allow_expressive && is_expressive(c) {
+        if allow_expressive && is_expressive(c, expressive_chars) {
             continue;
         }
         return true;
@@ -209,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &ranges,
                     config.allow_emoji,
                     config.allow_expressive,
+                    &config.expressive_chars,
                 ) {
                     warn!(
                         "Message [{}] violates language '{}' — flagging for audit",
@@ -286,6 +326,10 @@ mod tests {
 
     const LATIN: [[u32; 2]; 1] = [[0x41, 0x5A]]; // A-Z only
 
+    fn expr() -> Vec<String> {
+        default_expressive_chars()
+    }
+
     #[test]
     fn compose_rejected_carries_reason_raw_origin() {
         let chat = ChatMessage {
@@ -307,31 +351,41 @@ mod tests {
 
     #[test]
     fn ascii_uppercase_pass() {
-        assert!(!violates_language("HELLO", &LATIN, false, false));
-        assert!(!violates_language("HELLO WORLD", &LATIN, false, false));
+        assert!(!violates_language("HELLO", &LATIN, false, false, &expr()));
+        assert!(!violates_language("HELLO WORLD", &LATIN, false, false, &expr()));
     }
 
     #[test]
     fn lowercase_fails_outside_range() {
-        assert!(violates_language("hello", &LATIN, false, false));
+        assert!(violates_language("hello", &LATIN, false, false, &expr()));
     }
 
     #[test]
     fn non_latin_fails() {
-        assert!(violates_language("привет", &LATIN, false, false));
-        assert!(violates_language("HÉLLO", &LATIN, false, false));
+        assert!(violates_language("привет", &LATIN, false, false, &expr()));
+        assert!(violates_language("HÉLLO", &LATIN, false, false, &expr()));
     }
 
     #[test]
     fn emoji_gated_by_flag() {
-        assert!(violates_language("HELLO 👍", &LATIN, false, false));
-        assert!(!violates_language("HELLO 👍", &LATIN, true, false));
+        assert!(violates_language("HELLO 👍", &LATIN, false, false, &expr()));
+        assert!(!violates_language("HELLO 👍", &LATIN, true, false, &expr()));
     }
 
     #[test]
     fn expressive_gated_by_flag() {
-        assert!(violates_language("HELLO ඞ", &LATIN, false, false));
-        assert!(!violates_language("HELLO ඞ", &LATIN, false, true));
+        assert!(violates_language("HELLO ඞ", &LATIN, false, false, &expr()));
+        assert!(!violates_language("HELLO ඞ", &LATIN, false, true, &expr()));
+    }
+
+    #[test]
+    fn expressive_reads_from_config() {
+        // The configured list drives is_expressive: a char absent from it is
+        // not treated as expressive even when the flag is on.
+        let mut chars = default_expressive_chars();
+        chars.retain(|s| s != "ඞ");
+        assert!(violates_language("HELLO ඞ", &LATIN, false, true, &chars));
+        assert!(!violates_language("HELLO ♥", &LATIN, false, true, &chars));
     }
 
     #[test]
