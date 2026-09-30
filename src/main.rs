@@ -2,12 +2,22 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use cockatiel_client::CockatielClient;
 use cockatiel_client::proto::{container::Payload, *};
+
+type WsWriteHalf = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    WsMessage,
+>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
@@ -23,6 +33,18 @@ struct Config {
     flag_reason: String,
     #[serde(default = "default_expressive_chars")]
     expressive_chars: Vec<String>,
+    #[serde(default = "default_reconnect_base_secs")]
+    reconnect_base_secs: u64,
+    #[serde(default = "default_reconnect_max_secs")]
+    reconnect_max_secs: u64,
+}
+
+fn default_reconnect_base_secs() -> u64 {
+    1
+}
+
+fn default_reconnect_max_secs() -> u64 {
+    30
 }
 
 fn default_language() -> String {
@@ -61,6 +83,8 @@ fn default_config() -> Config {
         allow_expressive: false,
         flag_reason: default_reason(),
         expressive_chars: default_expressive_chars(),
+        reconnect_base_secs: default_reconnect_base_secs(),
+        reconnect_max_secs: default_reconnect_max_secs(),
     }
 }
 
@@ -203,122 +227,188 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let client = CockatielClient::connect("language_constrainer.json").await?;
-    let (mut write, mut read) = client.stream.split();
+    let (write, read) = client.stream.split();
+    let write_shared: Arc<AsyncMutex<WsWriteHalf>> = Arc::new(AsyncMutex::new(write));
     let auth_token = client.auth_token.clone();
     let instance_uuid = client.instance_uuid7.clone();
     let module_name = client.config.module_name.clone();
 
-    while let Some(msg) = read.next().await {
-        let Ok(WsMessage::Binary(data)) = msg else {
-            continue;
-        };
-        let Ok(container) = Container::decode(data.as_ref()) else {
-            continue;
-        };
+    // Owns the read half + session identity so it can reconnect with backoff
+    // when the engine drops the socket (instead of dying and leaving main to
+    // sleep forever while the watchdog severs the unresponsive module).
+    {
+        let write_shared = Arc::clone(&write_shared);
+        let mut auth_token = auth_token.clone();
+        let mut instance_uuid = instance_uuid.clone();
+        let mut module_name = module_name.clone();
+        let mut read = read;
+        tokio::spawn(async move {
+            'reconnect: loop {
+                loop {
+                    let Some(msg) = read.next().await else { break };
+                    let data = match msg {
+                        Ok(WsMessage::Binary(d)) => d,
+                        Ok(WsMessage::Close(_)) => {
+                            info!("Engine closed connection");
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => {
+                            warn!("Engine WebSocket error: {}", e);
+                            break;
+                        }
+                    };
+                    let Ok(container) = Container::decode(data.as_ref()) else { continue };
 
-        match container.payload {
-            Some(Payload::AuthVerify(_)) => {
-                // Answer the engine's liveness probe (this module reads the
-                // socket directly, so the client's auto-answer is bypassed).
-                let reply = Container {
-                    version: 1,
-                    auth_token: auth_token.clone(),
-                    module_name: module_name.clone(),
-                    module_instance_uuid7: instance_uuid.clone(),
-                    payload: Some(Payload::AuthVerify(AuthVerify {
-                        cur_auth: auth_token.clone(),
-                    })),
-                };
-                let mut buf = Vec::new();
-                if reply.encode(&mut buf).is_ok() {
-                    let _ = write.send(WsMessage::Binary(buf.into())).await;
+                    match container.payload {
+                        Some(Payload::AuthVerify(_)) => {
+                            // Answer the engine's liveness probe (this module
+                            // reads the socket directly, so the client's
+                            // auto-answer is bypassed — without this the
+                            // watchdog severs us).
+                            let reply = Container {
+                                version: 1,
+                                auth_token: auth_token.clone(),
+                                module_name: module_name.clone(),
+                                module_instance_uuid7: instance_uuid.clone(),
+                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                    cur_auth: auth_token.clone(),
+                                })),
+                            };
+                            let mut buf = Vec::new();
+                            if reply.encode(&mut buf).is_ok() {
+                                let mut w = write_shared.lock().await;
+                                let _ = w.send(WsMessage::Binary(buf)).await;
+                            }
+                        }
+                        Some(Payload::MessageInProcess(process)) => {
+                            let Some(chat) = &process.raw_message else { continue };
+                            let uuid = process.message_uuid7.clone();
+                            let original = chat.raw_message.clone();
+
+                            // Out-of-language messages are held for audit: the
+                            // engine broadcasts an audit prompt (Approve/Reject)
+                            // to connected UIs.
+                            if violates_language(
+                                &original,
+                                &ranges,
+                                config.allow_emoji,
+                                config.allow_expressive,
+                                &config.expressive_chars,
+                            ) {
+                                warn!(
+                                    "Message [{}] violates language '{}' — flagging for audit",
+                                    uuid, config.language
+                                );
+                                let flag = Container {
+                                    version: 1,
+                                    auth_token: auth_token.clone(),
+                                    module_name: module_name.clone(),
+                                    module_instance_uuid7: instance_uuid.clone(),
+                                    payload: Some(Payload::AuditFlag(AuditFlag {
+                                        message_uuid7: uuid.clone(),
+                                        reason: config.flag_reason.clone(),
+                                        origin: module_name.clone(),
+                                    })),
+                                };
+                                let mut buf = Vec::new();
+                                if flag.encode(&mut buf).is_ok() {
+                                    let mut w = write_shared.lock().await;
+                                    let _ = w.send(WsMessage::Binary(buf)).await;
+                                }
+                                // Also record the rejection clearly (raw +
+                                // reason), like the banned-words module — the
+                                // engine logs + persists it as a searchable
+                                // `chat_rejected` timeline record.
+                                let reason = format!("violates language '{}'", config.language);
+                                let rej = compose_rejected(
+                                    &uuid,
+                                    chat,
+                                    &original,
+                                    &reason,
+                                    &module_name,
+                                );
+                                let rej = Container {
+                                    version: 1,
+                                    auth_token: auth_token.clone(),
+                                    module_name: module_name.clone(),
+                                    module_instance_uuid7: instance_uuid.clone(),
+                                    payload: Some(Payload::ChatMessageRejected(rej)),
+                                };
+                                let mut buf = Vec::new();
+                                if rej.encode(&mut buf).is_ok() {
+                                    let mut w = write_shared.lock().await;
+                                    let _ = w.send(WsMessage::Binary(buf)).await;
+                                }
+                            }
+
+                            // Ack in_process (content preserved — the audit hold
+                            // prevents it from being shown until a moderator
+                            // releases it).
+                            let reply = Container {
+                                version: 1,
+                                auth_token: auth_token.clone(),
+                                module_name: module_name.clone(),
+                                module_instance_uuid7: instance_uuid.clone(),
+                                payload: Some(Payload::MessageInProcess(MessageInProcess {
+                                    message_uuid7: uuid,
+                                    raw_message: Some(ChatMessage {
+                                        platform: chat.platform.clone(),
+                                        raw_data: chat.raw_data.clone(),
+                                        raw_message: original.clone(),
+                                        user_uuid7: chat.user_uuid7.clone(),
+                                        command: chat.command.clone(),
+                                        channel_id: chat.channel_id.clone(),
+                                        user_data: chat.user_data.clone(),
+                                    }),
+                                    processed_message: original,
+                                    abandon_message: false,
+                                    audio: Vec::new(),
+                                    audio_type: String::new(),
+                                })),
+                            };
+                            let mut buf = Vec::new();
+                            if reply.encode(&mut buf).is_ok() {
+                                let mut w = write_shared.lock().await;
+                                let _ = w.send(WsMessage::Binary(buf)).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // The engine connection dropped — reconnect with backoff
+                // instead of leaving the module unresponsive.
+                info!("Engine disconnected — reconnecting...");
+                let mut backoff = config.reconnect_base_secs;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    match CockatielClient::connect("language_constrainer.json").await {
+                        Ok(conn) => {
+                            info!("Reconnected to engine");
+                            let (w, r) = conn.stream.split();
+                            *write_shared.lock().await = w;
+                            auth_token = conn.auth_token;
+                            instance_uuid = conn.instance_uuid7;
+                            module_name = conn.config.module_name;
+                            read = r;
+                            continue 'reconnect;
+                        }
+                        Err(e) => {
+                            warn!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
+                            backoff = (backoff * 2).min(config.reconnect_max_secs);
+                        }
+                    }
                 }
             }
-            Some(Payload::MessagePreProcess(pre)) => {
-                let Some(chat) = &pre.raw_message else {
-                    continue;
-                };
-                let uuid = pre.message_uuid7.clone();
-                let original = chat.raw_message.clone();
-
-                // Out-of-language messages are held for audit: the engine
-                // broadcasts an audit prompt (Approve/Reject) to connected UIs.
-                if violates_language(
-                    &original,
-                    &ranges,
-                    config.allow_emoji,
-                    config.allow_expressive,
-                    &config.expressive_chars,
-                ) {
-                    warn!(
-                        "Message [{}] violates language '{}' — flagging for audit",
-                        uuid, config.language
-                    );
-                    let flag = Container {
-                        version: 1,
-                        auth_token: auth_token.clone(),
-                        module_name: module_name.clone(),
-                        module_instance_uuid7: instance_uuid.clone(),
-                        payload: Some(Payload::AuditFlag(AuditFlag {
-                            message_uuid7: uuid.clone(),
-                            reason: config.flag_reason.clone(),
-                            origin: module_name.clone(),
-                        })),
-                    };
-                    let mut buf = Vec::new();
-                    if flag.encode(&mut buf).is_ok() {
-                        let _ = write.send(WsMessage::Binary(buf.into())).await;
-                    }
-                    // Also record the rejection clearly (raw + reason), like the
-                    // banned-words module — the engine logs + persists it as a
-                    // searchable `chat_rejected` timeline record.
-                    let reason = format!("violates language '{}'", config.language);
-                    let rej = compose_rejected(&uuid, chat, &original, &reason, &module_name);
-                    let rej = Container {
-                        version: 1,
-                        auth_token: auth_token.clone(),
-                        module_name: module_name.clone(),
-                        module_instance_uuid7: instance_uuid.clone(),
-                        payload: Some(Payload::ChatMessageRejected(rej)),
-                    };
-                    let mut buf = Vec::new();
-                    if rej.encode(&mut buf).is_ok() {
-                        let _ = write.send(WsMessage::Binary(buf.into())).await;
-                    }
-                }
-
-                // Ack pre_process (content preserved — the audit hold prevents
-                // it from being shown until a moderator releases it).
-                let reply = Container {
-                    version: 1,
-                    auth_token: auth_token.clone(),
-                    module_name: module_name.clone(),
-                    module_instance_uuid7: instance_uuid.clone(),
-                    payload: Some(Payload::MessagePreProcess(MessagePreProcess {
-audio: Vec::new(),
-                            audio_type: String::new(),
-                        message_uuid7: uuid,
-                        raw_message: Some(ChatMessage {
-                            platform: chat.platform.clone(),
-                            raw_data: chat.raw_data.clone(),
-                            raw_message: original,
-                            user_uuid7: chat.user_uuid7.clone(),
-                            command: chat.command.clone(),
-                            channel_id: chat.channel_id.clone(),
-                            user_data: chat.user_data.clone(),
-                        }),
-                    })),
-                };
-                let mut buf = Vec::new();
-                if reply.encode(&mut buf).is_ok() {
-                    let _ = write.send(WsMessage::Binary(buf.into())).await;
-                }
-            }
-            _ => {}
-        }
+        });
     }
 
-    Ok(())
+    // The read task owns the socket now; park forever. The watchdog severs a
+    // silent module, and AuthVerify answers keep us alive during dead air.
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
 }
 #[cfg(test)]
 mod tests {
