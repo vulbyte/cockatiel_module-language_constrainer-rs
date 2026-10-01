@@ -10,7 +10,9 @@ use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use cockatiel_client::CockatielClient;
-use cockatiel_client::proto::{container::Payload, *};
+use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
+use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
+use cockatiel_client::proto::*;
 
 type WsWriteHalf = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<
@@ -199,7 +201,7 @@ fn compose_rejected(
     ChatMessageRejected {
         message_uuid7: message_uuid7.to_string(),
         message: Some(chat.clone()),
-        processed_message: processed.to_string(),
+        processed_message: Some(processed.to_string()),
         reason: reason.to_string(),
         origin: origin.to_string(),
     }
@@ -258,20 +260,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     };
-                    let Ok(container) = Container::decode(data.as_ref()) else { continue };
+                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
 
                     match container.payload {
-                        Some(Payload::AuthVerify(_)) => {
+                        Some(ModulePayload::AuthVerify(_)) => {
                             // Answer the engine's liveness probe (this module
                             // reads the socket directly, so the client's
                             // auto-answer is bypassed — without this the
                             // watchdog severs us).
-                            let reply = Container {
-                                version: 1,
+                            let reply = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth_token.clone(),
                                 module_name: module_name.clone(),
                                 module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                payload: Some(EnginePayload::AuthVerify(AuthVerify {
                                     cur_auth: auth_token.clone(),
                                 })),
                             };
@@ -281,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = w.send(WsMessage::Binary(buf)).await;
                             }
                         }
-                        Some(Payload::MessageInProcess(process)) => {
+                        Some(ModulePayload::MessageInProcess(process)) => {
                             let Some(chat) = &process.raw_message else { continue };
                             let uuid = process.message_uuid7.clone();
                             let original = chat.raw_message.clone();
@@ -300,12 +302,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "Message [{}] violates language '{}' — flagging for audit",
                                     uuid, config.language
                                 );
-                                let flag = Container {
-                                    version: 1,
+                                let flag = ContainerForEngine {
+                                    version: 2,
                                     auth_token: auth_token.clone(),
                                     module_name: module_name.clone(),
                                     module_instance_uuid7: instance_uuid.clone(),
-                                    payload: Some(Payload::AuditFlag(AuditFlag {
+                                    payload: Some(EnginePayload::AuditFlag(AuditFlag {
                                         message_uuid7: uuid.clone(),
                                         reason: config.flag_reason.clone(),
                                         origin: module_name.clone(),
@@ -328,12 +330,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &reason,
                                     &module_name,
                                 );
-                                let rej = Container {
-                                    version: 1,
+                                let rej = ContainerForEngine {
+                                    version: 2,
                                     auth_token: auth_token.clone(),
                                     module_name: module_name.clone(),
                                     module_instance_uuid7: instance_uuid.clone(),
-                                    payload: Some(Payload::ChatMessageRejected(rej)),
+                                    payload: Some(EnginePayload::ChatMessageRejected(rej)),
                                 };
                                 let mut buf = Vec::new();
                                 if rej.encode(&mut buf).is_ok() {
@@ -345,12 +347,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Ack in_process (content preserved — the audit hold
                             // prevents it from being shown until a moderator
                             // releases it).
-                            let reply = Container {
-                                version: 1,
+                            let reply = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth_token.clone(),
                                 module_name: module_name.clone(),
                                 module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::MessageInProcess(MessageInProcess {
+                                payload: Some(EnginePayload::MessageInProcess(MessageInProcess {
                                     message_uuid7: uuid,
                                     raw_message: Some(ChatMessage {
                                         platform: chat.platform.clone(),
@@ -435,7 +437,7 @@ mod tests {
         assert_eq!(rej.message_uuid7, "uuid-9");
         assert_eq!(rej.origin, "language-constrainer");
         assert_eq!(rej.reason, "violates language 'latin'");
-        assert_eq!(rej.processed_message, "Привет");
+        assert_eq!(rej.processed_message, Some("Привет".to_string()));
         assert_eq!(rej.message.unwrap().raw_message, "Привет");
     }
 
