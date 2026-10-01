@@ -25,10 +25,11 @@
   ],
   "capabilities": "inprocess",
   "command_flags": [
+    "run",
     "--release"
   ],
   "description": "constrains chat to a target language; out-of-language messages are held for audit (a moderator must approve/reject them)",
-  "launch_command": "cargo run",
+  "launch_command": "cargo",
   "min_rank": 0,
   "name": "language-constrainer",
   "price": 0,
