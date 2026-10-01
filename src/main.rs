@@ -36,16 +36,16 @@ struct Config {
     #[serde(default = "default_expressive_chars")]
     expressive_chars: Vec<String>,
     #[serde(default = "default_reconnect_base_secs")]
-    reconnect_base_secs: u64,
+    reconnect_base_secs: u32,
     #[serde(default = "default_reconnect_max_secs")]
-    reconnect_max_secs: u64,
+    reconnect_max_secs: u32,
 }
 
-fn default_reconnect_base_secs() -> u64 {
+fn default_reconnect_base_secs() -> u32 {
     1
 }
 
-fn default_reconnect_max_secs() -> u64 {
+fn default_reconnect_max_secs() -> u32 {
     30
 }
 
@@ -400,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Engine disconnected — reconnecting...");
                 let mut backoff = config.reconnect_base_secs;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
                     match CockatielClient::connect("language_constrainer.json").await {
                         Ok(conn) => {
                             info!("Reconnected to engine");

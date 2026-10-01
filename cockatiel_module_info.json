@@ -28,13 +28,6 @@
     "run",
     "--release"
   ],
-  "description": "constrains chat to a target language; out-of-language messages are held for audit (a moderator must approve/reject them)",
-  "launch_command": "cargo",
-  "min_rank": 0,
-  "name": "language-constrainer",
-  "price": 0,
-  "root_file": "./src/main.rs",
-  "version": "0.1.0",
   "credentials": [
     {
       "key": "language",
@@ -60,5 +53,12 @@
       "list": false,
       "sensitive": false
     }
-  ]
+  ],
+  "description": "constrains chat to a target language; out-of-language messages are held for audit (a moderator must approve/reject them)",
+  "launch_command": "cargo",
+  "min_rank": 0,
+  "name": "language-constrainer",
+  "price": 0,
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
 }
