@@ -189,6 +189,17 @@ fn violates_language(
     false
 }
 
+/// The text a module should operate on: the accumulated in-process text from
+/// earlier modules, falling back to the raw chat message only when that is
+/// empty. Checking the raw message would discard earlier modules' edits.
+fn effective_text<'a>(chat_raw: &'a str, incoming: &'a str) -> &'a str {
+    if incoming.trim().is_empty() {
+        chat_raw
+    } else {
+        incoming
+    }
+}
+
 /// Build the ChatMessageRejected record so the engine logs the rejection
 /// clearly (reason + original raw message + what it became).
 fn compose_rejected(
@@ -302,13 +313,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = w.send(WsMessage::Binary(buf)).await;
                                 }
                             }
-                            let original = chat.raw_message.clone();
+                            // Check the accumulated in-process text from earlier
+                            // modules, falling back to the raw message only when
+                            // it is empty — otherwise their edits are discarded.
+                            let incoming = process.processed_message.clone();
+                            let text = effective_text(&chat.raw_message, &incoming);
 
                             // Out-of-language messages are held for audit: the
                             // engine broadcasts an audit prompt (Approve/Reject)
                             // to connected UIs.
                             if violates_language(
-                                &original,
+                                text,
                                 &ranges,
                                 config.allow_emoji,
                                 config.allow_expressive,
@@ -342,7 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let rej = compose_rejected(
                                     &uuid,
                                     chat,
-                                    &original,
+                                    text,
                                     &reason,
                                     &module_name,
                                 );
@@ -373,13 +388,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     raw_message: Some(ChatMessage {
                                         platform: chat.platform.clone(),
                                         raw_data: chat.raw_data.clone(),
-                                        raw_message: original.clone(),
+                                        raw_message: chat.raw_message.clone(),
                                         user_uuid7: chat.user_uuid7.clone(),
                                         command: chat.command.clone(),
                                         channel_id: chat.channel_id.clone(),
                                         user_data: chat.user_data.clone(),
                                     }),
-                                    processed_message: original,
+                                    processed_message: text.to_string(),
                                     abandon_message: false,
                                     audio: Vec::new(),
                                     audio_type: String::new(),
@@ -455,6 +470,29 @@ mod tests {
         assert_eq!(rej.reason, "violates language 'latin'");
         assert_eq!(rej.processed_message, Some("Привет".to_string()));
         assert_eq!(rej.message.unwrap().raw_message, "Привет");
+    }
+
+    #[test]
+    fn incoming_processed_text_is_used_and_raw_fallback_only_when_empty() {
+        // A prior module rewrote the Cyrillic message to Latin uppercase; the
+        // language check must see the transformed text, not the raw one.
+        assert_eq!(effective_text("привет", "HELLO"), "HELLO");
+        assert!(!violates_language(
+            effective_text("привет", "HELLO"),
+            &LATIN,
+            false,
+            false,
+            &expr()
+        ));
+        // An empty incoming falls back to the raw message.
+        assert_eq!(effective_text("привет", ""), "привет");
+        assert!(violates_language(
+            effective_text("привет", ""),
+            &LATIN,
+            false,
+            false,
+            &expr()
+        ));
     }
 
     #[test]
