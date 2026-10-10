@@ -59,11 +59,11 @@
   "min_rank": 0,
   "name": "language-constrainer",
   "price": 0,
-  "root_file": "./src/main.rs",
-  "version": "0.1.0",
   "release": {
-    "repo": "vulbyte/cockatiel_module-language_constrainer-rs",
     "base_url": "https://github.com/vulbyte/cockatiel_module-language_constrainer-rs/releases/download",
+    "repo": "vulbyte/cockatiel_module-language_constrainer-rs",
     "tag": "v0.1.0"
-  }
+  },
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
 }
