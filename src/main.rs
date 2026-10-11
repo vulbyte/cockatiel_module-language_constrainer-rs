@@ -8,16 +8,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
+use unicode_normalization::UnicodeNormalization;
 
-use cockatiel_client::CockatielClient;
 use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
 use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
 use cockatiel_client::proto::*;
+use cockatiel_client::CockatielClient;
 
 type WsWriteHalf = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
 
@@ -35,10 +34,28 @@ struct Config {
     flag_reason: String,
     #[serde(default = "default_expressive_chars")]
     expressive_chars: Vec<String>,
+    #[serde(default = "default_allowed_languages")]
+    allowed_languages: Vec<String>,
+    #[serde(default = "default_detect_min_chars")]
+    detect_min_chars: u32,
+    #[serde(default = "default_detect_confidence")]
+    detect_confidence: f32,
     #[serde(default = "default_reconnect_base_secs")]
     reconnect_base_secs: u32,
     #[serde(default = "default_reconnect_max_secs")]
     reconnect_max_secs: u32,
+}
+
+fn default_allowed_languages() -> Vec<String> {
+    vec!["eng".to_string()]
+}
+
+fn default_detect_min_chars() -> u32 {
+    12
+}
+
+fn default_detect_confidence() -> f32 {
+    0.3
 }
 
 fn default_reconnect_base_secs() -> u32 {
@@ -85,6 +102,9 @@ fn default_config() -> Config {
         allow_expressive: false,
         flag_reason: default_reason(),
         expressive_chars: default_expressive_chars(),
+        allowed_languages: default_allowed_languages(),
+        detect_min_chars: default_detect_min_chars(),
+        detect_confidence: default_detect_confidence(),
         reconnect_base_secs: default_reconnect_base_secs(),
         reconnect_max_secs: default_reconnect_max_secs(),
     }
@@ -135,11 +155,17 @@ struct Languages {
     presets: HashMap<String, Vec<[u32; 2]>>,
 }
 
+fn parse_languages(s: &str) -> Option<HashMap<String, Vec<[u32; 2]>>> {
+    serde_json::from_str::<Languages>(s).ok().map(|l| l.presets)
+}
+
+const EMBEDDED_LANGUAGES: &str = include_str!("../languages.json");
+
 fn load_languages() -> HashMap<String, Vec<[u32; 2]>> {
     std::fs::read_to_string("languages.json")
         .ok()
-        .and_then(|s| serde_json::from_str::<Languages>(&s).ok())
-        .map(|l| l.presets)
+        .and_then(|s| parse_languages(&s))
+        .or_else(|| parse_languages(EMBEDDED_LANGUAGES))
         .unwrap_or_default()
 }
 
@@ -151,15 +177,18 @@ fn is_emoji(c: char) -> bool {
         || (0x1F680..=0x1F6FF).contains(&cp)
         || (0x1F900..=0x1F9FF).contains(&cp)
         || (0x1FA70..=0x1FAFF).contains(&cp)
+        || (0x1F1E6..=0x1F1FF).contains(&cp)
+        || (0x1F3FB..=0x1F3FF).contains(&cp)
         || (0x2600..=0x27BF).contains(&cp)
         || (0xFE00..=0xFE0F).contains(&cp)
         || (0x1F000..=0x1F0FF).contains(&cp)
+        || cp == 0x20E3
 }
 
 /// Characters commonly used for expressive/emote messages (e.g. ඞ, (๑ > ᴗ < ๑)),
 /// read from config (defaults to the curated list) so operators can extend it.
 fn is_expressive(c: char, expressive_chars: &[String]) -> bool {
-    expressive_chars.iter().any(|s| s.starts_with(c))
+    expressive_chars.iter().any(|s| s.contains(c))
 }
 
 fn in_ranges(c: char, ranges: &[[u32; 2]]) -> bool {
@@ -167,7 +196,14 @@ fn in_ranges(c: char, ranges: &[[u32; 2]]) -> bool {
     ranges.iter().any(|r| cp >= r[0] && cp <= r[1])
 }
 
-fn violates_language(
+/// NFC-normalize so decomposed Latin (e + U+0301) is checked like precomposed é.
+fn normalize(text: &str) -> String {
+    text.nfc().collect()
+}
+
+/// Per-character range gate: true when a char is outside the whitelist and not
+/// exempted as emoji/expressive.
+fn violates_range_gate(
     message: &str,
     ranges: &[[u32; 2]],
     allow_emoji: bool,
@@ -187,6 +223,63 @@ fn violates_language(
         return true;
     }
     false
+}
+
+/// Strip a leading command token (`!cmd` / `/cmd`) and following spaces so
+/// language detection sees only the argument text.
+fn strip_command_token(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('!') || trimmed.starts_with('/')) {
+        return trimmed;
+    }
+    match trimmed.find(char::is_whitespace) {
+        Some(idx) => trimmed[idx..].trim_start(),
+        None => "",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DetectCfg<'a> {
+    allowed_languages: &'a [String],
+    min_chars: u32,
+    confidence: f32,
+}
+
+fn violates_language(
+    message: &str,
+    ranges: &[[u32; 2]],
+    allow_emoji: bool,
+    allow_expressive: bool,
+    expressive_chars: &[String],
+    detect: DetectCfg<'_>,
+) -> bool {
+    if violates_range_gate(
+        message,
+        ranges,
+        allow_emoji,
+        allow_expressive,
+        expressive_chars,
+    ) {
+        return true;
+    }
+    if detect.allowed_languages.is_empty() {
+        return false;
+    }
+    let scan = strip_command_token(message);
+    let alphabetic = scan.chars().filter(|c| c.is_alphabetic()).count() as u32;
+    if alphabetic < detect.min_chars {
+        return false;
+    }
+    match whatlang::detect(scan) {
+        None => false,
+        Some(info) => {
+            let allowed = detect
+                .allowed_languages
+                .iter()
+                .any(|l| l.eq_ignore_ascii_case(info.lang().code()));
+            !allowed && info.confidence() >= detect.confidence as f64
+        }
+    }
 }
 
 /// The text a module should operate on: the accumulated in-process text from
@@ -215,6 +308,14 @@ fn compose_rejected(
         processed_message: Some(processed.to_string()),
         reason: reason.to_string(),
         origin: origin.to_string(),
+    }
+}
+
+async fn send_msg(write_shared: &Arc<AsyncMutex<WsWriteHalf>>, container: ContainerForEngine) {
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_shared.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
     }
 }
 
@@ -257,6 +358,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut read = read;
         tokio::spawn(async move {
             'reconnect: loop {
+                // Register an empty command list: per the proto this makes the
+                // module a catch-all, so it receives command messages (e.g.
+                // `!tts <text>`) instead of only the owner's plain messages.
+                send_msg(
+                    &write_shared,
+                    ContainerForEngine {
+                        version: 2,
+                        auth_token: auth_token.clone(),
+                        module_name: module_name.clone(),
+                        module_instance_uuid7: instance_uuid.clone(),
+                        payload: Some(EnginePayload::Commands(Commands {
+                            commands: vec![],
+                            alert_on_unknown_command: false,
+                        })),
+                    },
+                )
+                .await;
                 loop {
                     let Some(msg) = read.next().await else { break };
                     let data = match msg {
@@ -271,7 +389,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     };
-                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
+                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else {
+                        continue;
+                    };
 
                     match container.payload {
                         Some(ModulePayload::AuthVerify(_)) => {
@@ -288,14 +408,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     cur_auth: auth_token.clone(),
                                 })),
                             };
-                            let mut buf = Vec::new();
-                            if reply.encode(&mut buf).is_ok() {
-                                let mut w = write_shared.lock().await;
-                                let _ = w.send(WsMessage::Binary(buf)).await;
-                            }
+                            send_msg(&write_shared, reply).await;
                         }
                         Some(ModulePayload::MessageInProcess(process)) => {
-                            let Some(chat) = &process.raw_message else { continue };
+                            let Some(chat) = &process.raw_message else {
+                                continue;
+                            };
                             let uuid = process.message_uuid7.clone();
                             if !uuid.is_empty() {
                                 let receipt = ContainerForEngine {
@@ -307,27 +425,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         message_uuid7: uuid.clone(),
                                     })),
                                 };
-                                let mut buf = Vec::new();
-                                if receipt.encode(&mut buf).is_ok() {
-                                    let mut w = write_shared.lock().await;
-                                    let _ = w.send(WsMessage::Binary(buf)).await;
-                                }
+                                send_msg(&write_shared, receipt).await;
                             }
                             // Check the accumulated in-process text from earlier
                             // modules, falling back to the raw message only when
                             // it is empty — otherwise their edits are discarded.
                             let incoming = process.processed_message.clone();
                             let text = effective_text(&chat.raw_message, &incoming);
+                            let text = normalize(text);
 
                             // Out-of-language messages are held for audit: the
                             // engine broadcasts an audit prompt (Approve/Reject)
                             // to connected UIs.
                             if violates_language(
-                                text,
+                                &text,
                                 &ranges,
                                 config.allow_emoji,
                                 config.allow_expressive,
                                 &config.expressive_chars,
+                                DetectCfg {
+                                    allowed_languages: &config.allowed_languages,
+                                    min_chars: config.detect_min_chars,
+                                    confidence: config.detect_confidence,
+                                },
                             ) {
                                 warn!(
                                     "Message [{}] violates language '{}' — flagging for audit",
@@ -344,23 +464,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         origin: module_name.clone(),
                                     })),
                                 };
-                                let mut buf = Vec::new();
-                                if flag.encode(&mut buf).is_ok() {
-                                    let mut w = write_shared.lock().await;
-                                    let _ = w.send(WsMessage::Binary(buf)).await;
-                                }
+                                send_msg(&write_shared, flag).await;
                                 // Also record the rejection clearly (raw +
                                 // reason), like the banned-words module — the
                                 // engine logs + persists it as a searchable
                                 // `chat_rejected` timeline record.
                                 let reason = format!("violates language '{}'", config.language);
-                                let rej = compose_rejected(
-                                    &uuid,
-                                    chat,
-                                    text,
-                                    &reason,
-                                    &module_name,
-                                );
+                                let rej =
+                                    compose_rejected(&uuid, chat, &text, &reason, &module_name);
                                 let rej = ContainerForEngine {
                                     version: 2,
                                     auth_token: auth_token.clone(),
@@ -368,11 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     module_instance_uuid7: instance_uuid.clone(),
                                     payload: Some(EnginePayload::ChatMessageRejected(rej)),
                                 };
-                                let mut buf = Vec::new();
-                                if rej.encode(&mut buf).is_ok() {
-                                    let mut w = write_shared.lock().await;
-                                    let _ = w.send(WsMessage::Binary(buf)).await;
-                                }
+                                send_msg(&write_shared, rej).await;
                             }
 
                             // Ack in_process (content preserved — the audit hold
@@ -394,17 +501,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         channel_id: chat.channel_id.clone(),
                                         user_data: chat.user_data.clone(),
                                     }),
-                                    processed_message: text.to_string(),
+                                    processed_message: text.clone(),
                                     abandon_message: false,
                                     audio: Vec::new(),
                                     audio_type: String::new(),
                                 })),
                             };
-                            let mut buf = Vec::new();
-                            if reply.encode(&mut buf).is_ok() {
-                                let mut w = write_shared.lock().await;
-                                let _ = w.send(WsMessage::Binary(buf)).await;
-                            }
+                            send_msg(&write_shared, reply).await;
                         }
                         _ => {}
                     }
@@ -448,9 +551,49 @@ mod tests {
     use super::*;
 
     const LATIN: [[u32; 2]; 1] = [[0x41, 0x5A]]; // A-Z only
+    const MIN: u32 = 12;
+    const CONF: f32 = 0.3;
 
     fn expr() -> Vec<String> {
         default_expressive_chars()
+    }
+
+    fn real_latin() -> Vec<[u32; 2]> {
+        load_languages().get("latin").cloned().unwrap_or_default()
+    }
+
+    fn allowed() -> Vec<String> {
+        vec!["eng".to_string()]
+    }
+
+    fn cfg<'a>(allowed_languages: &'a [String], min_chars: u32, confidence: f32) -> DetectCfg<'a> {
+        DetectCfg {
+            allowed_languages,
+            min_chars,
+            confidence,
+        }
+    }
+
+    // Range gate only: empty allowed_languages disables detection.
+    fn range(
+        msg: &str,
+        ranges: &[[u32; 2]],
+        emoji: bool,
+        expressive: bool,
+        chars: &[String],
+    ) -> bool {
+        violates_language(msg, ranges, emoji, expressive, chars, cfg(&[], MIN, CONF))
+    }
+
+    fn detected(msg: &str, allowed_languages: &[String], confidence: f32) -> bool {
+        violates_language(
+            &normalize(msg),
+            &real_latin(),
+            false,
+            false,
+            &expr(),
+            cfg(allowed_languages, MIN, confidence),
+        )
     }
 
     #[test]
@@ -464,7 +607,13 @@ mod tests {
             user_data: None,
             channel_id: "chan".into(),
         };
-        let rej = compose_rejected("uuid-9", &chat, "Привет", "violates language 'latin'", "language-constrainer");
+        let rej = compose_rejected(
+            "uuid-9",
+            &chat,
+            "Привет",
+            "violates language 'latin'",
+            "language-constrainer",
+        );
         assert_eq!(rej.message_uuid7, "uuid-9");
         assert_eq!(rej.origin, "language-constrainer");
         assert_eq!(rej.reason, "violates language 'latin'");
@@ -477,7 +626,7 @@ mod tests {
         // A prior module rewrote the Cyrillic message to Latin uppercase; the
         // language check must see the transformed text, not the raw one.
         assert_eq!(effective_text("привет", "HELLO"), "HELLO");
-        assert!(!violates_language(
+        assert!(!range(
             effective_text("привет", "HELLO"),
             &LATIN,
             false,
@@ -486,7 +635,7 @@ mod tests {
         ));
         // An empty incoming falls back to the raw message.
         assert_eq!(effective_text("привет", ""), "привет");
-        assert!(violates_language(
+        assert!(range(
             effective_text("привет", ""),
             &LATIN,
             false,
@@ -497,31 +646,38 @@ mod tests {
 
     #[test]
     fn ascii_uppercase_pass() {
-        assert!(!violates_language("HELLO", &LATIN, false, false, &expr()));
-        assert!(!violates_language("HELLO WORLD", &LATIN, false, false, &expr()));
+        assert!(!range("HELLO", &LATIN, false, false, &expr()));
+        assert!(!range("HELLO WORLD", &LATIN, false, false, &expr()));
     }
 
     #[test]
     fn lowercase_fails_outside_range() {
-        assert!(violates_language("hello", &LATIN, false, false, &expr()));
+        assert!(range("hello", &LATIN, false, false, &expr()));
     }
 
     #[test]
     fn non_latin_fails() {
-        assert!(violates_language("привет", &LATIN, false, false, &expr()));
-        assert!(violates_language("HÉLLO", &LATIN, false, false, &expr()));
+        assert!(range("привет", &LATIN, false, false, &expr()));
+        assert!(range("HÉLLO", &LATIN, false, false, &expr()));
     }
 
     #[test]
     fn emoji_gated_by_flag() {
-        assert!(violates_language("HELLO 👍", &LATIN, false, false, &expr()));
-        assert!(!violates_language("HELLO 👍", &LATIN, true, false, &expr()));
+        assert!(range("HELLO 👍", &LATIN, false, false, &expr()));
+        assert!(!range("HELLO 👍", &LATIN, true, false, &expr()));
+    }
+
+    #[test]
+    fn emoji_covers_flags_and_skin_tones() {
+        for c in ['\u{1F1FA}', '\u{1F1F8}', '\u{1F3FB}', '\u{20E3}'] {
+            assert!(is_emoji(c), "expected {c:?} to be emoji");
+        }
     }
 
     #[test]
     fn expressive_gated_by_flag() {
-        assert!(violates_language("HELLO ඞ", &LATIN, false, false, &expr()));
-        assert!(!violates_language("HELLO ඞ", &LATIN, false, true, &expr()));
+        assert!(range("HELLO ඞ", &LATIN, false, false, &expr()));
+        assert!(!range("HELLO ඞ", &LATIN, false, true, &expr()));
     }
 
     #[test]
@@ -530,8 +686,31 @@ mod tests {
         // not treated as expressive even when the flag is on.
         let mut chars = default_expressive_chars();
         chars.retain(|s| s != "ඞ");
-        assert!(violates_language("HELLO ඞ", &LATIN, false, true, &chars));
-        assert!(!violates_language("HELLO ♥", &LATIN, false, true, &chars));
+        assert!(range("HELLO ඞ", &LATIN, false, true, &chars));
+        assert!(!range("HELLO ♥", &LATIN, false, true, &chars));
+    }
+
+    #[test]
+    fn expressive_multichar_entry_whitelists_all_its_chars() {
+        let mut chars = expr();
+        chars.push("(๑ > ᴗ < ๑)".to_string());
+        assert!(is_expressive('>', &chars));
+        assert!(is_expressive('ᴗ', &chars));
+        // With the flag on they are exempt; without it ᴗ is outside the preset.
+        assert!(!violates_range_gate(
+            "( > ᴗ )",
+            &real_latin(),
+            false,
+            true,
+            &chars
+        ));
+        assert!(violates_range_gate(
+            "( > ᴗ )",
+            &real_latin(),
+            false,
+            false,
+            &chars
+        ));
     }
 
     #[test]
@@ -540,5 +719,126 @@ mod tests {
         assert!(in_ranges('Z', &LATIN));
         assert!(!in_ranges('a', &LATIN));
         assert!(!in_ranges('1', &LATIN));
+    }
+
+    #[test]
+    fn embedded_languages_fallback_has_latin_preset() {
+        let presets = parse_languages(EMBEDDED_LANGUAGES).expect("embedded languages parse");
+        assert!(!presets.get("latin").expect("latin preset").is_empty());
+    }
+
+    #[test]
+    fn nfc_normalization_accepts_decomposed_latin() {
+        // e + U+0301 folds to é (U+00E9), inside the real latin preset; the
+        // raw combining mark alone is outside it.
+        assert!(violates_range_gate(
+            "e\u{0301}",
+            &real_latin(),
+            false,
+            false,
+            &expr()
+        ));
+        assert!(!violates_range_gate(
+            &normalize("e\u{0301}"),
+            &real_latin(),
+            false,
+            false,
+            &expr()
+        ));
+    }
+
+    #[test]
+    fn non_latin_scripts_violate() {
+        let cases = [
+            "Сара ауаа зегьы бзиа избоит.",
+            "Я люблю всіх людей.",
+            "Мон вань адямиосты яратӥсько.",
+            "Шупту улуска ынак мен.",
+            "Мин барлык кешеләрне яратам.",
+            "हम सब लोक स प्रेम करैत छी।",
+            "अहं सर्वान् जनान् प्रेम करोमि।",
+            "म सबै मानिसहरूलाई माया गर्छु।",
+            "コンピューター",
+            "ང་མི་ཚང་མར་དགའ།",
+            "ฉันรักทุกคน",
+            "මම සියලුම මිනිසුන්ට ආදරෙයි.",
+            "ನಾನು ಎಲ್ಲ ಜನರನ್ನು ಪ್ರೀತಿಸುತ್ತೇನೆ.",
+            "איך האָב ליב אַלע מענטשן.",
+            "ߒߓߋ ߡߜ߭ߐߥߵ ߍ ߞߊߣߎ",
+        ];
+        for msg in cases {
+            assert!(
+                detected(msg, &allowed(), CONF),
+                "expected violation for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn latin_script_foreign_languages_violate() {
+        // Vietnamese is caught by the range gate (Latin-Extended-Additional chars
+        // fall outside the `latin` preset); Indonesian by the detection gate.
+        for msg in ["Tôi yêu tất cả mọi người.", "Saya mencintai semua orang."] {
+            assert!(
+                detected(msg, &allowed(), CONF),
+                "expected violation for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn turkish_violates_at_tuned_confidence() {
+        // whatlang 0.18's default Combined detector reports the Turkish sentence
+        // as Azerbaijani at confidence 0.222, below the 0.3 floor, so it needs a
+        // lower threshold to flag. Kept as documentation of that limitation.
+        let msg = "Bütün insanları seviyorum.";
+        assert!(!detected(msg, &allowed(), CONF));
+        assert!(detected(msg, &allowed(), 0.2));
+    }
+
+    #[test]
+    fn english_passes() {
+        // Includes phrases whatlang misclassifies at LOW confidence (0.03-0.28:
+        // uzb/tgl/fra/nob/jav) precisely so the 0.3 floor is regression-guarded
+        // against false positives on ordinary English chat.
+        for msg in [
+            "I love all people.",
+            "hello everyone how are you doing today",
+            "that was a great play dude",
+            "I am begging pardon",
+            "let me know if you want me to play something else",
+            "laughing out loud",
+            "bro that was insane clutch",
+            "happy birthday to you happy birthday to you",
+        ] {
+            assert!(
+                !detected(msg, &allowed(), CONF),
+                "expected pass for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_emotes_below_detection_floor_pass() {
+        for msg in ["gg", "lol", "hi", "kekw", "<3"] {
+            assert!(
+                !detected(msg, &allowed(), CONF),
+                "expected pass for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_token_is_stripped_for_detection() {
+        assert!(detected(
+            "!tts Saya mencintai semua orang.",
+            &allowed(),
+            CONF
+        ));
+        assert!(!detected("!tts hello chat", &allowed(), CONF));
+        assert_eq!(strip_command_token("!tts hello"), "hello");
+        assert_eq!(strip_command_token("/me waves"), "waves");
+        assert_eq!(strip_command_token("plain"), "plain");
+        assert_eq!(strip_command_token("!alone"), "");
     }
 }

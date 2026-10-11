@@ -52,6 +52,24 @@
       "label": "Flag reason",
       "list": false,
       "sensitive": false
+    },
+    {
+      "key": "allowed_languages",
+      "label": "Allowed languages (ISO 639-3, e.g. eng)",
+      "list": true,
+      "sensitive": false
+    },
+    {
+      "key": "detect_min_chars",
+      "label": "Min chars before language detection",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "detect_confidence",
+      "label": "Min detection confidence (0-1)",
+      "list": false,
+      "sensitive": false
     }
   ],
   "description": "constrains chat to a target language; out-of-language messages are held for audit (a moderator must approve/reject them)",
