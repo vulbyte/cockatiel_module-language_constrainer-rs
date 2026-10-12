@@ -55,7 +55,7 @@ fn default_detect_min_chars() -> u32 {
 }
 
 fn default_detect_confidence() -> f32 {
-    0.3
+    0.7
 }
 
 fn default_reconnect_base_secs() -> u32 {
@@ -201,8 +201,23 @@ fn normalize(text: &str) -> String {
     text.nfc().collect()
 }
 
+/// Fold common typographic punctuation to its ASCII counterpart. The range
+/// gate checks the folded char so everyday English using smart quotes /
+/// apostrophes / dashes / ellipses is not held for audit; the displayed
+/// (`processed_message`) text is never altered.
+fn fold_typographic(c: char) -> char {
+    match c {
+        '\u{2018}' | '\u{2019}' => '\'',
+        '\u{201C}' | '\u{201D}' => '"',
+        '\u{2013}' | '\u{2014}' => '-',
+        '\u{2026}' => '.',
+        other => other,
+    }
+}
+
 /// Per-character range gate: true when a char is outside the whitelist and not
-/// exempted as emoji/expressive.
+/// exempted as emoji/expressive. Typographic punctuation is folded to ASCII
+/// first (gate check only), and `is_whitespace` already accepts U+00A0 NBSP.
 fn violates_range_gate(
     message: &str,
     ranges: &[[u32; 2]],
@@ -211,7 +226,7 @@ fn violates_range_gate(
     expressive_chars: &[String],
 ) -> bool {
     for c in message.chars() {
-        if c.is_whitespace() || in_ranges(c, ranges) {
+        if c.is_whitespace() || in_ranges(fold_typographic(c), ranges) {
             continue;
         }
         if allow_emoji && is_emoji(c) {
@@ -236,6 +251,36 @@ fn strip_command_token(text: &str) -> &str {
         Some(idx) => trimmed[idx..].trim_start(),
         None => "",
     }
+}
+
+/// True when a whitespace-delimited token looks like a URL: a scheme URL, or a
+/// dotted host followed by a path (the shapes Discord/Twitch embeds use, e.g.
+/// `cdn.discordapp.com/attachments/…/x.gif?ex=…`).
+fn is_url_token(tok: &str) -> bool {
+    let lower = tok.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return true;
+    }
+    matches!(tok.find('.'), Some(dot) if dot + 1 < tok.len() && tok[dot + 1..].contains('/'))
+}
+
+/// Prepare text for `whatlang`: drop URL tokens and tokens that are mostly
+/// non-alphabetic (emoji, punctuation runs, `$100`, …). whatlang misreads this
+/// link/emoji soup as a foreign language (e.g. a Discord CDN URL was detected
+/// as Portuguese at 0.505), which held ordinary English for audit.
+fn detection_text(scan: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for tok in scan.split_whitespace() {
+        if is_url_token(tok) {
+            continue;
+        }
+        let total = tok.chars().count() as u32;
+        let alpha = tok.chars().filter(|c| c.is_alphabetic()).count() as u32;
+        if alpha * 2 >= total {
+            kept.push(tok);
+        }
+    }
+    kept.join(" ")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,18 +311,25 @@ fn violates_language(
         return false;
     }
     let scan = strip_command_token(message);
+    let scan = detection_text(scan);
     let alphabetic = scan.chars().filter(|c| c.is_alphabetic()).count() as u32;
     if alphabetic < detect.min_chars {
         return false;
     }
-    match whatlang::detect(scan) {
+    match whatlang::detect(&scan) {
         None => false,
         Some(info) => {
             let allowed = detect
                 .allowed_languages
                 .iter()
                 .any(|l| l.eq_ignore_ascii_case(info.lang().code()));
-            !allowed && info.confidence() >= detect.confidence as f64
+            // whatlang's `confidence` is not a probability: it saturates
+            // toward 1.0 on short text, so a bare floor holds ordinary ASCII
+            // English. Flag only when the detected language is not allowed
+            // AND the detection is whatlang-reliable (>0.9) or clears the
+            // configured floor — reliable detections always flag, and the
+            // operator floor stays authoritative at the (0.7) default.
+            !allowed && (info.is_reliable() || info.confidence() >= detect.confidence as f64)
         }
     }
 }
@@ -552,7 +604,7 @@ mod tests {
 
     const LATIN: [[u32; 2]; 1] = [[0x41, 0x5A]]; // A-Z only
     const MIN: u32 = 12;
-    const CONF: f32 = 0.3;
+    const CONF: f32 = 0.7; // matches default_detect_confidence()
 
     fn expr() -> Vec<String> {
         default_expressive_chars()
@@ -789,7 +841,7 @@ mod tests {
     #[test]
     fn turkish_violates_at_tuned_confidence() {
         // whatlang 0.18's default Combined detector reports the Turkish sentence
-        // as Azerbaijani at confidence 0.222, below the 0.3 floor, so it needs a
+        // as Azerbaijani at confidence 0.222, below the 0.7 floor, so it needs a
         // lower threshold to flag. Kept as documentation of that limitation.
         let msg = "Bütün insanları seviyorum.";
         assert!(!detected(msg, &allowed(), CONF));
@@ -799,7 +851,7 @@ mod tests {
     #[test]
     fn english_passes() {
         // Includes phrases whatlang misclassifies at LOW confidence (0.03-0.28:
-        // uzb/tgl/fra/nob/jav) precisely so the 0.3 floor is regression-guarded
+        // uzb/tgl/fra/nob/jav) precisely so the 0.7 floor is regression-guarded
         // against false positives on ordinary English chat.
         for msg in [
             "I love all people.",
@@ -816,6 +868,87 @@ mod tests {
                 "expected pass for {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn typographic_punctuation_does_not_violate() {
+        // The exact live strings that were held for audit: curly apostrophes /
+        // quotes / ellipses are outside the raw `latin` ranges, but the gate
+        // folds them to ASCII and the smart-quote English passes detection.
+        let cases = [
+            "Isn\u{2019}t it broken iirc?",
+            "\u{201C}Dew it!\u{201D} - Palpatine",
+            "Hopefully they\u{2019}re easy enough fixes xwx",
+            "Have you fixed the stream rig btw? What\u{2019}s happening???",
+            "a reference to the 1940\u{2019}s cartoon\u{2026}",
+            "test\u{2013}case and a long\u{2014}dash",
+        ];
+        for msg in cases {
+            assert!(
+                !violates_range_gate(msg, &real_latin(), false, false, &expr()),
+                "range gate flagged {msg:?}"
+            );
+            assert!(
+                !detected(msg, &allowed(), CONF),
+                "detection flagged {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typographic_fold_works_without_preset_ranges() {
+        // A custom preset that lacks the typographic ranges must still pass:
+        // the gate folds these to ASCII, so it can't regress.
+        let ascii: [[u32; 2]; 1] = [[32, 126]];
+        for c in [
+            '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2013}', '\u{2014}', '\u{2026}',
+        ] {
+            assert!(!in_ranges(c, &ascii), "{c:?} unexpectedly in ASCII range");
+            assert!(
+                !violates_range_gate(&c.to_string(), &ascii, false, false, &expr()),
+                "fold failed for {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_breaking_space_is_whitespace() {
+        assert!('\u{00A0}'.is_whitespace());
+        assert!(!violates_range_gate(
+            "Have\u{00A0}you fixed the stream rig?",
+            &real_latin(),
+            false,
+            false,
+            &expr()
+        ));
+    }
+
+    #[test]
+    fn discord_cdn_url_passes() {
+        // A live Discord CDN URL was detected as Portuguese at 0.505 and held;
+        // URL stripping drops it before whatlang runs.
+        let url = "https://cdn.discordapp.com/attachments/1300251755614965840/1559072465362362398/pyro-pyro-tf2.gif?ex=6acdbee1&is=6acc6d61&hm=f1e8a454f27fe016b4ae5ae8f66322d16b0b2ec4d35b4d70bdc12f6786ba2ef0&";
+        assert!(is_url_token(url));
+        assert_eq!(detection_text(url), "");
+        assert!(
+            !detected(url, &allowed(), CONF),
+            "expected Discord CDN URL to pass"
+        );
+        // A bare host+path (no scheme) is also stripped.
+        assert!(!detected(
+            "cdn.discordapp.com/attachments/1/2/IMG_5478.jpg?ex=abc",
+            &allowed(),
+            CONF
+        ));
+    }
+
+    #[test]
+    fn detection_text_drops_non_alphabetic_tokens() {
+        assert_eq!(detection_text("hello ??? world"), "hello world");
+        assert_eq!(detection_text("$100 kekw 1337"), "kekw");
+        assert_eq!(detection_text("it\u{2019}s fine"), "it\u{2019}s fine");
+        // Half-or-more alphabetic tokens survive; punctuation runs do not.
+        assert_eq!(detection_text("a. b! \u{2014} ok"), "a. b! ok");
     }
 
     #[test]
