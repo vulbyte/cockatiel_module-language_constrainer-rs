@@ -37,7 +37,7 @@
     },
     {
       "key": "allow_emoji",
-      "label": "Allow emoji",
+      "label": "Allow emoji (off = any emoji holds an otherwise-English message)",
       "list": false,
       "sensitive": false
     },

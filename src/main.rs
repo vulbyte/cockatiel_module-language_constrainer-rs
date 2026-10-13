@@ -169,7 +169,9 @@ fn load_languages() -> HashMap<String, Vec<[u32; 2]>> {
         .unwrap_or_default()
 }
 
-/// Common emoji Unicode ranges.
+/// Common emoji Unicode ranges, plus the zero-width joiner and variation
+/// selectors that only ever appear inside emoji sequences (so they are
+/// exempted only when `allow_emoji` is on).
 fn is_emoji(c: char) -> bool {
     let cp = c as u32;
     (0x1F300..=0x1F5FF).contains(&cp)
@@ -180,9 +182,11 @@ fn is_emoji(c: char) -> bool {
         || (0x1F1E6..=0x1F1FF).contains(&cp)
         || (0x1F3FB..=0x1F3FF).contains(&cp)
         || (0x2600..=0x27BF).contains(&cp)
+        || (0x2B00..=0x2BFF).contains(&cp)
         || (0xFE00..=0xFE0F).contains(&cp)
         || (0x1F000..=0x1F0FF).contains(&cp)
         || cp == 0x20E3
+        || cp == 0x200D
 }
 
 /// Characters commonly used for expressive/emote messages (e.g. ඞ, (๑ > ᴗ < ๑)),
@@ -203,21 +207,30 @@ fn normalize(text: &str) -> String {
 
 /// Fold common typographic punctuation to its ASCII counterpart. The range
 /// gate checks the folded char so everyday English using smart quotes /
-/// apostrophes / dashes / ellipses is not held for audit; the displayed
-/// (`processed_message`) text is never altered.
+/// apostrophes / dashes / ellipses / bullets / primes / arrows is not held for
+/// audit; the displayed (`processed_message`) text is never altered.
 fn fold_typographic(c: char) -> char {
     match c {
         '\u{2018}' | '\u{2019}' => '\'',
-        '\u{201C}' | '\u{201D}' => '"',
-        '\u{2013}' | '\u{2014}' => '-',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' => '"',
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' => '-',
         '\u{2026}' => '.',
+        '\u{2022}' => '*',
+        '\u{2027}' => '.',
+        '\u{2032}' => '\'',
+        '\u{2033}' => '"',
+        '\u{2039}' => '<',
+        '\u{203A}' => '>',
+        '\u{2122}' => 'T',
+        '\u{2190}'..='\u{21FF}' => '-',
         other => other,
     }
 }
 
 /// Per-character range gate: true when a char is outside the whitelist and not
 /// exempted as emoji/expressive. Typographic punctuation is folded to ASCII
-/// first (gate check only), and `is_whitespace` already accepts U+00A0 NBSP.
+/// first (gate check only), zero-width spaces are stripped, and
+/// `is_whitespace` already accepts U+00A0 NBSP.
 fn violates_range_gate(
     message: &str,
     ranges: &[[u32; 2]],
@@ -226,7 +239,7 @@ fn violates_range_gate(
     expressive_chars: &[String],
 ) -> bool {
     for c in message.chars() {
-        if c.is_whitespace() || in_ranges(fold_typographic(c), ranges) {
+        if c.is_whitespace() || c == '\u{200B}' || in_ranges(fold_typographic(c), ranges) {
             continue;
         }
         if allow_emoji && is_emoji(c) {
@@ -290,6 +303,45 @@ struct DetectCfg<'a> {
     confidence: f32,
 }
 
+/// Outcome of the language check, carrying enough detail to explain a hold.
+#[derive(Debug, Clone)]
+enum Verdict {
+    /// Within the configured range/language whitelist.
+    Pass,
+    /// Outside the range whitelist (script, punctuation, emoji, …).
+    Range,
+    /// The detector judged the text a non-allowed language; carries the
+    /// detected ISO 639-3 code and whatlang confidence so the flag is
+    /// diagnosable.
+    Detected { lang: String, confidence: f32 },
+}
+
+impl Verdict {
+    /// `<code> (<confidence>)` when the language detector — not the range gate
+    /// — caused the flag.
+    fn detection_detail(&self) -> Option<String> {
+        match self {
+            Verdict::Detected { lang, confidence } => Some(format!("{} ({:.2})", lang, confidence)),
+            _ => None,
+        }
+    }
+}
+
+/// The `AuditFlag` reason: the configured `flag_reason` prefix (falling back to
+/// `out-of-language`) plus, when the detector caused the flag, the detected
+/// language code and confidence so the certainty is diagnosable.
+fn audit_reason(flag_reason: &str, verdict: &Verdict) -> String {
+    let prefix = if flag_reason.trim().is_empty() {
+        default_reason()
+    } else {
+        flag_reason.trim().to_string()
+    };
+    match verdict.detection_detail() {
+        Some(detail) => format!("{}: {}", prefix, detail),
+        None => prefix,
+    }
+}
+
 fn violates_language(
     message: &str,
     ranges: &[[u32; 2]],
@@ -297,7 +349,7 @@ fn violates_language(
     allow_expressive: bool,
     expressive_chars: &[String],
     detect: DetectCfg<'_>,
-) -> bool {
+) -> Verdict {
     if violates_range_gate(
         message,
         ranges,
@@ -305,31 +357,36 @@ fn violates_language(
         allow_expressive,
         expressive_chars,
     ) {
-        return true;
+        return Verdict::Range;
     }
     if detect.allowed_languages.is_empty() {
-        return false;
+        return Verdict::Pass;
     }
     let scan = strip_command_token(message);
     let scan = detection_text(scan);
     let alphabetic = scan.chars().filter(|c| c.is_alphabetic()).count() as u32;
     if alphabetic < detect.min_chars {
-        return false;
+        return Verdict::Pass;
     }
     match whatlang::detect(&scan) {
-        None => false,
+        None => Verdict::Pass,
         Some(info) => {
             let allowed = detect
                 .allowed_languages
                 .iter()
                 .any(|l| l.eq_ignore_ascii_case(info.lang().code()));
-            // whatlang's `confidence` is not a probability: it saturates
-            // toward 1.0 on short text, so a bare floor holds ordinary ASCII
-            // English. Flag only when the detected language is not allowed
-            // AND the detection is whatlang-reliable (>0.9) or clears the
-            // configured floor — reliable detections always flag, and the
-            // operator floor stays authoritative at the (0.7) default.
-            !allowed && (info.is_reliable() || info.confidence() >= detect.confidence as f64)
+            // `detect.confidence` is authoritative: whatlang's hardcoded
+            // `is_reliable()` (>0.9) is deliberately NOT consulted, so the
+            // operator can set any floor — raising it relaxes the gate past
+            // 0.9, lowering it tightens it.
+            if !allowed && info.confidence() >= detect.confidence as f64 {
+                Verdict::Detected {
+                    lang: info.lang().code().to_string(),
+                    confidence: info.confidence() as f32,
+                }
+            } else {
+                Verdict::Pass
+            }
         }
     }
 }
@@ -489,7 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Out-of-language messages are held for audit: the
                             // engine broadcasts an audit prompt (Approve/Reject)
                             // to connected UIs.
-                            if violates_language(
+                            let verdict = violates_language(
                                 &text,
                                 &ranges,
                                 config.allow_emoji,
@@ -500,10 +557,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     min_chars: config.detect_min_chars,
                                     confidence: config.detect_confidence,
                                 },
-                            ) {
+                            );
+                            if !matches!(verdict, Verdict::Pass) {
+                                let detail = verdict.detection_detail();
                                 warn!(
-                                    "Message [{}] violates language '{}' — flagging for audit",
-                                    uuid, config.language
+                                    "Message [{}] violates language '{}' — flagging for audit{}",
+                                    uuid,
+                                    config.language,
+                                    detail
+                                        .as_deref()
+                                        .map(|d| format!(" ({})", d))
+                                        .unwrap_or_default()
                                 );
                                 let flag = ContainerForEngine {
                                     version: 2,
@@ -512,7 +576,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     module_instance_uuid7: instance_uuid.clone(),
                                     payload: Some(EnginePayload::AuditFlag(AuditFlag {
                                         message_uuid7: uuid.clone(),
-                                        reason: config.flag_reason.clone(),
+                                        reason: audit_reason(&config.flag_reason, &verdict),
                                         origin: module_name.clone(),
                                     })),
                                 };
@@ -521,7 +585,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // reason), like the banned-words module — the
                                 // engine logs + persists it as a searchable
                                 // `chat_rejected` timeline record.
-                                let reason = format!("violates language '{}'", config.language);
+                                let reason = match &detail {
+                                    Some(d) => {
+                                        format!("violates language '{}' ({})", config.language, d)
+                                    }
+                                    None => format!("violates language '{}'", config.language),
+                                };
                                 let rej =
                                     compose_rejected(&uuid, chat, &text, &reason, &module_name);
                                 let rej = ContainerForEngine {
@@ -634,17 +703,23 @@ mod tests {
         expressive: bool,
         chars: &[String],
     ) -> bool {
-        violates_language(msg, ranges, emoji, expressive, chars, cfg(&[], MIN, CONF))
+        !matches!(
+            violates_language(msg, ranges, emoji, expressive, chars, cfg(&[], MIN, CONF)),
+            Verdict::Pass
+        )
     }
 
     fn detected(msg: &str, allowed_languages: &[String], confidence: f32) -> bool {
-        violates_language(
-            &normalize(msg),
-            &real_latin(),
-            false,
-            false,
-            &expr(),
-            cfg(allowed_languages, MIN, confidence),
+        !matches!(
+            violates_language(
+                &normalize(msg),
+                &real_latin(),
+                false,
+                false,
+                &expr(),
+                cfg(allowed_languages, MIN, confidence),
+            ),
+            Verdict::Pass
         )
     }
 
@@ -724,6 +799,26 @@ mod tests {
         for c in ['\u{1F1FA}', '\u{1F1F8}', '\u{1F3FB}', '\u{20E3}'] {
             assert!(is_emoji(c), "expected {c:?} to be emoji");
         }
+    }
+
+    #[test]
+    fn emoji_covers_stars_arrows_and_joiners() {
+        // Stars/arrows (U+2B00–U+2BFF) and the ZWJ / variation selectors that
+        // glue emoji sequences together are treated as emoji so a sequence
+        // passes only when `allow_emoji` is on.
+        for c in ['\u{2B50}', '\u{2B06}', '\u{2B05}', '\u{200D}', '\u{FE0F}'] {
+            assert!(is_emoji(c), "expected {c:?} to be emoji");
+        }
+        assert!(range("HELLO \u{2B50}", &LATIN, false, false, &expr()));
+        assert!(!range("HELLO \u{2B50}", &LATIN, true, false, &expr()));
+        // Family: woman + ZWJ + girl is one emoji sequence.
+        assert!(!range(
+            "\u{1F469}\u{200D}\u{1F467}",
+            &LATIN,
+            true,
+            false,
+            &expr()
+        ));
     }
 
     #[test]
@@ -901,7 +996,10 @@ mod tests {
         // the gate folds these to ASCII, so it can't regress.
         let ascii: [[u32; 2]; 1] = [[32, 126]];
         for c in [
-            '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2013}', '\u{2014}', '\u{2026}',
+            '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{201E}', '\u{2010}', '\u{2011}',
+            '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2022}', '\u{2026}', '\u{2027}',
+            '\u{2032}', '\u{2033}', '\u{2039}', '\u{203A}', '\u{2122}', '\u{2190}', '\u{2192}',
+            '\u{21FF}',
         ] {
             assert!(!in_ranges(c, &ascii), "{c:?} unexpectedly in ASCII range");
             assert!(
@@ -909,6 +1007,123 @@ mod tests {
                 "fold failed for {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn extended_typographic_punctuation_passes_range_gate() {
+        // Ordinary English with an em-dash, ™, arrows, a bullet, primes, single
+        // guillemets and a zero-width space must all pass the range gate (and
+        // therefore detection) rather than being held for audit.
+        let cases = [
+            "that was a long\u{2014}dash",
+            "brand\u{2122} new setup",
+            "go \u{2192} then \u{2190} back",
+            "look \u{2191} and \u{2193}",
+            "zero\u{200B}width space here",
+            "a bulleted \u{2022} list",
+            "5\u{2032} and 6\u{2033} tall",
+            "\u{2039}quoted\u{203A} text",
+            "low \u{201E}quote\u{201D} mark",
+            "figure\u{2012}dash and bar\u{2015}test",
+            "hyphen\u{2010}ated non\u{2011}breaking",
+        ];
+        for msg in cases {
+            assert!(
+                !violates_range_gate(msg, &real_latin(), false, false, &expr()),
+                "range gate flagged {msg:?}"
+            );
+            assert!(
+                !detected(msg, &allowed(), CONF),
+                "detection flagged {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_width_space_is_stripped_by_gate_only() {
+        // U+200B is not `is_whitespace`, so it must be explicitly skipped; the
+        // displayed text is untouched (the gate is check-only).
+        assert!(!'\u{200B}'.is_whitespace());
+        let ascii: [[u32; 2]; 1] = [[32, 126]];
+        assert!(!violates_range_gate(
+            "a\u{200B}b",
+            &ascii,
+            false,
+            false,
+            &expr()
+        ));
+    }
+
+    #[test]
+    fn detection_reason_surfaces_language_and_confidence() {
+        let msg = "Saya mencintai semua orang."; // Indonesian, not allowed
+        let verdict = violates_language(
+            &normalize(msg),
+            &real_latin(),
+            false,
+            false,
+            &expr(),
+            cfg(&allowed(), MIN, CONF),
+        );
+        match &verdict {
+            Verdict::Detected { lang, confidence } => {
+                assert!(!lang.is_empty(), "detected lang code was empty");
+                assert!(
+                    *confidence >= CONF,
+                    "confidence {confidence} should clear the floor"
+                );
+                let reason = audit_reason("out-of-language", &verdict);
+                assert!(
+                    reason.starts_with("out-of-language: "),
+                    "reason was {reason:?}"
+                );
+                assert!(reason.contains(lang), "reason was {reason:?}");
+                assert!(reason.contains(&format!("{:.2}", confidence)));
+            }
+            other => panic!("expected a detection verdict, got {other:?}"),
+        }
+        // An empty configured prefix falls back to the default.
+        assert!(audit_reason("", &verdict).starts_with("out-of-language: "));
+        // A range-gate hold carries no detection detail.
+        assert_eq!(audit_reason("custom", &Verdict::Range), "custom");
+    }
+
+    #[test]
+    fn detect_confidence_floor_is_operator_authoritative() {
+        // The configured floor — not whatlang's hardcoded is_reliable() (>0.9)
+        // — decides. A detection at confidence c flags for any floor <= c and
+        // passes for any floor > c, so the operator can relax past 0.9.
+        let msg = "Saya mencintai semua orang."; // Indonesian, not allowed
+        let (lang, confidence) = match violates_language(
+            &normalize(msg),
+            &real_latin(),
+            false,
+            false,
+            &expr(),
+            cfg(&allowed(), MIN, 0.0),
+        ) {
+            Verdict::Detected { lang, confidence } => (lang, confidence),
+            other => panic!("expected a detection verdict, got {other:?}"),
+        };
+        assert!(!lang.is_empty());
+        assert!(confidence > 0.0 && confidence <= 1.0);
+        // Floor at the detection confidence: still flags (>=).
+        assert!(detected(msg, &allowed(), confidence));
+        // Floor just above it: the operator has relaxed it past.
+        assert!(!detected(msg, &allowed(), (confidence + 0.01).min(1.0)));
+        // Dropping whatlang's 0.9 ceiling is the point: a floor above 0.9 now
+        // actually relaxes instead of being overridden by is_reliable().
+        assert!(!detected(msg, &allowed(), 0.95));
+    }
+
+    #[test]
+    fn lowering_detect_confidence_tightens_not_relaxes() {
+        // Documents the comparison direction: `confidence >= floor`, so a
+        // mid-confidence non-allowed detection passes at a higher floor and is
+        // held at a lower one.
+        let msg = "Bütün insanları seviyorum."; // Turkish, whatlang ~0.22
+        assert!(!detected(msg, &allowed(), CONF));
+        assert!(detected(msg, &allowed(), 0.2));
     }
 
     #[test]
