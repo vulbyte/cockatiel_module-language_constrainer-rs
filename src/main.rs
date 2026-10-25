@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -19,6 +19,38 @@ type WsWriteHalf = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
+
+const BANS_COMMAND: &str = "language";
+const MODULE_BANS_QUERY: &str = "module_bans_query";
+const MODULE_BANS_REPORT: &str = "module_bans_report";
+const DM_DB: &str = "_dm";
+
+fn commands_registration(flag: &str) -> Commands {
+    Commands {
+        commands: vec![Command {
+            command_name: BANS_COMMAND.to_string(),
+            command_flag: flag.to_string(),
+            command_description: "manage language-constrainer bans".to_string(),
+            command_flags: vec![],
+        }],
+        // Keep receiving plain messages: the module's real job is language
+        // enforcement, the command only exists for ban/unban.
+        alert_on_unknown_command: true,
+    }
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    } else if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    }
+    path.to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
@@ -44,6 +76,24 @@ struct Config {
     reconnect_base_secs: u32,
     #[serde(default = "default_reconnect_max_secs")]
     reconnect_max_secs: u32,
+    #[serde(default = "default_command_flag")]
+    command_flag: String,
+    #[serde(default = "default_data_dir")]
+    data_dir: String,
+    #[serde(default = "default_bans_path")]
+    bans_path: String,
+}
+
+fn default_command_flag() -> String {
+    "!".to_string()
+}
+
+fn default_data_dir() -> String {
+    "~/.cockatiel/language-constrainer".to_string()
+}
+
+fn default_bans_path() -> String {
+    "~/.cockatiel/language-constrainer/bans.json".to_string()
 }
 
 fn default_allowed_languages() -> Vec<String> {
@@ -107,6 +157,9 @@ fn default_config() -> Config {
         detect_confidence: default_detect_confidence(),
         reconnect_base_secs: default_reconnect_base_secs(),
         reconnect_max_secs: default_reconnect_max_secs(),
+        command_flag: default_command_flag(),
+        data_dir: default_data_dir(),
+        bans_path: default_bans_path(),
     }
 }
 
@@ -391,6 +444,320 @@ fn violates_language(
     }
 }
 
+// ── bans.json ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct BanEntry {
+    user: String,
+    key: String,
+    by: String,
+    reason: String,
+    at: i64,
+}
+
+type BanMap = HashMap<String, HashMap<String, BanEntry>>;
+
+fn load_bans(path: &str) -> BanMap {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|d| serde_json::from_str::<BanMap>(&d).ok())
+        .unwrap_or_default()
+}
+
+fn save_bans(path: &str, map: &BanMap) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn normalize_ban_user(tok: &str) -> String {
+    let t = tok.trim();
+    if let Some(inner) = t.strip_prefix("<@") {
+        let inner = inner.trim_end_matches('>');
+        let inner = inner.trim_start_matches(['!', '&']);
+        return inner.trim().to_string();
+    }
+    t.trim_start_matches('@').trim().to_string()
+}
+
+fn all_ban_ids(map: &BanMap) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for guild in map.values() {
+        for entry in guild.values() {
+            let id = entry.user.trim();
+            if !id.is_empty() && seen.insert(id.to_string()) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_banned_in_guild(map: &BanMap, guild: &str, candidates: &[&str]) -> bool {
+    let Some(banned) = map.get(guild) else {
+        return false;
+    };
+    candidates.iter().any(|c| {
+        let c = c.trim();
+        !c.is_empty() && banned.values().any(|b| b.user == c)
+    })
+}
+
+fn guild_key(chat: &ChatMessage) -> String {
+    let guild = serde_json::from_slice::<serde_json::Value>(&chat.raw_data)
+        .ok()
+        .and_then(|v| v.get("guild_id").and_then(|x| x.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    if guild.is_empty() {
+        DM_DB.to_string()
+    } else {
+        guild
+    }
+}
+
+fn discord_author(raw_data: &[u8]) -> (String, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw_data) else {
+        return (String::new(), String::new());
+    };
+    let author = v.get("author");
+    let id = author
+        .and_then(|a| a.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let username = author
+        .and_then(|a| a.get("username"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    (id, username)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// mtime-cached ban file: a hand edit is picked up on the next message.
+struct BanStore {
+    path: String,
+    cache: Option<BanMap>,
+    mtime: Option<std::time::SystemTime>,
+}
+
+impl BanStore {
+    fn new(path: &str) -> Self {
+        Self {
+            path: expand_tilde(path),
+            cache: None,
+            mtime: None,
+        }
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn bans(&mut self) -> &BanMap {
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        if self.cache.is_none() || mtime != self.mtime {
+            self.cache = Some(load_bans(&self.path));
+            self.mtime = mtime;
+        }
+        self.cache.as_ref().unwrap()
+    }
+
+    fn invalidate(&mut self) {
+        self.cache = None;
+        self.mtime = None;
+    }
+}
+
+fn bans_report_container(auth: &str, module: &str, instance: &str, map: &BanMap) -> ContainerForEngine {
+    let json = serde_json::json!({ "bans": all_ban_ids(map) }).to_string();
+    ContainerForEngine {
+        version: 2,
+        auth_token: auth.to_string(),
+        module_name: module.to_string(),
+        module_instance_uuid7: instance.to_string(),
+        payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+            query_id: MODULE_BANS_REPORT.to_string(),
+            sql: json,
+            params: Vec::new(),
+        })),
+    }
+}
+
+fn ban_actor(chat: &ChatMessage) -> (bool, String) {
+    let Some(ud) = chat.user_data.as_ref() else {
+        return (false, chat.user_uuid7.clone());
+    };
+    let allowed = ud.is_moderator || ud.is_admin || ud.is_owner;
+    let actor = if !ud.uuid.is_empty() {
+        ud.uuid.clone()
+    } else if !ud.username.is_empty() {
+        ud.username.clone()
+    } else {
+        chat.user_uuid7.clone()
+    };
+    (allowed, actor)
+}
+
+fn reply_container(auth: &str, module: &str, instance: &str, chat: &ChatMessage, msg: String) -> ContainerForEngine {
+    let handle = chat
+        .user_data
+        .as_ref()
+        .map(|u| u.username.clone())
+        .unwrap_or_default();
+    ContainerForEngine {
+        version: 2,
+        auth_token: auth.to_string(),
+        module_name: module.to_string(),
+        module_instance_uuid7: instance.to_string(),
+        payload: Some(EnginePayload::SendToPlatforms(SendToPlatforms {
+            msg,
+            level: 0,
+            module_uuid7: instance.to_string(),
+            pid: String::new(),
+            platform: chat.platform.clone(),
+            actor_platform: chat.platform.clone(),
+            actor_handle: handle,
+            actor_uuid7: chat.user_uuid7.clone(),
+            channel_id: chat.channel_id.clone(),
+        })),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum BanCmd {
+    Ban { user: String, reason: String },
+    Unban(String),
+}
+
+fn parse_ban_subcommand(args: &str) -> Option<BanCmd> {
+    let args = args.trim();
+    let (head, rest) = match args.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim()),
+        None => (args, ""),
+    };
+    match head.to_ascii_lowercase().as_str() {
+        "ban" => {
+            let (user, reason) = match rest.split_once(char::is_whitespace) {
+                Some((u, r)) => (u, r.trim()),
+                None => (rest, ""),
+            };
+            (!user.is_empty()).then(|| BanCmd::Ban {
+                user: user.to_string(),
+                reason: reason.to_string(),
+            })
+        }
+        "unban" => {
+            let target = rest.split_whitespace().next().unwrap_or("");
+            (!target.is_empty()).then(|| BanCmd::Unban(target.to_string()))
+        }
+        _ => None,
+    }
+}
+
+enum BanOutcome {
+    Reply(String),
+    Report(String, BanMap),
+}
+
+fn handle_bans_command(
+    chat: &ChatMessage,
+    args: &str,
+    store: &mut BanStore,
+    label: &str,
+) -> Option<BanOutcome> {
+    let cmd = parse_ban_subcommand(args)?;
+    let guild = guild_key(chat);
+    let (allowed, actor) = ban_actor(chat);
+    if !allowed {
+        return Some(BanOutcome::Reply(format!(
+            "Only moderators can manage {label} bans."
+        )));
+    }
+    let mut map = load_bans(store.path());
+    let outcome = match cmd {
+        BanCmd::Ban { user, reason } => {
+            let target = normalize_ban_user(&user);
+            if target.is_empty() {
+                return Some(BanOutcome::Reply(
+                    "Usage: `ban <user> [reason]`.".to_string(),
+                ));
+            }
+            let entry = BanEntry {
+                user: target.clone(),
+                key: target.clone(),
+                by: actor,
+                reason: reason.clone(),
+                at: now_ms(),
+            };
+            map.entry(guild.clone()).or_default().insert(target.clone(), entry);
+            match save_bans(store.path(), &map) {
+                Ok(()) => {
+                    store.invalidate();
+                    if reason.is_empty() {
+                        BanOutcome::Report(format!("Banned `{target}` from {label}."), map)
+                    } else {
+                        BanOutcome::Report(
+                            format!("Banned `{target}` from {label}: {reason}"),
+                            map,
+                        )
+                    }
+                }
+                Err(e) => BanOutcome::Reply(format!("Could not save the ban: {e}")),
+            }
+        }
+        BanCmd::Unban(user) => {
+            let target = normalize_ban_user(&user);
+            let removed = map
+                .get_mut(&guild)
+                .and_then(|g| g.remove(&target))
+                .is_some();
+            if removed && map.get(&guild).map(|g| g.is_empty()).unwrap_or(false) {
+                map.remove(&guild);
+            }
+            match save_bans(store.path(), &map) {
+                Ok(()) => {
+                    store.invalidate();
+                    if removed {
+                        BanOutcome::Report(format!("Unbanned `{target}` from {label}."), map)
+                    } else {
+                        BanOutcome::Reply(format!("`{target}` was not banned."))
+                    }
+                }
+                Err(e) => BanOutcome::Reply(format!("Could not save the ban list: {e}")),
+            }
+        }
+    };
+    Some(outcome)
+}
+
+
+
+/// Strip the `<flag><command>` prefix from a routed command message.
+fn strip_command(raw: &str, flag: &str, name: &str) -> String {
+    let mut rest = raw.trim().to_string();
+    if let Some(idx) = rest.find(flag) {
+        rest = rest[idx + flag.len()..].trim_start().to_string();
+    }
+    if rest.starts_with(name) {
+        rest = rest[name.len()..].trim_start().to_string();
+    }
+    rest
+}
+
 /// The text a module should operate on: the accumulated in-process text from
 /// earlier modules, falling back to the raw chat message only when that is
 /// empty. Checking the raw message would discard earlier modules' edits.
@@ -465,11 +832,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut instance_uuid = instance_uuid.clone();
         let mut module_name = module_name.clone();
         let mut read = read;
+        let mut bans = BanStore::new(&config.bans_path);
         tokio::spawn(async move {
             'reconnect: loop {
-                // Register an empty command list: per the proto this makes the
-                // module a catch-all, so it receives command messages (e.g.
-                // `!tts <text>`) instead of only the owner's plain messages.
+                // Register the minimal ban command (plain messages still reach
+                // the language check) and announce current bans.
                 send_msg(
                     &write_shared,
                     ContainerForEngine {
@@ -477,13 +844,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         auth_token: auth_token.clone(),
                         module_name: module_name.clone(),
                         module_instance_uuid7: instance_uuid.clone(),
-                        payload: Some(EnginePayload::Commands(Commands {
-                            commands: vec![],
-                            alert_on_unknown_command: false,
-                        })),
+                        payload: Some(EnginePayload::Commands(commands_registration(
+                            &config.command_flag,
+                        ))),
                     },
                 )
                 .await;
+                {
+                    let report = {
+                        let map = bans.bans();
+                        bans_report_container(&auth_token, &module_name, &instance_uuid, map)
+                    };
+                    send_msg(&write_shared, report).await;
+                }
                 loop {
                     let Some(msg) = read.next().await else { break };
                     let data = match msg {
@@ -535,6 +908,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     })),
                                 };
                                 send_msg(&write_shared, receipt).await;
+                            }
+                            {
+                                let guild = guild_key(chat);
+                                let (author_id, author_name) = discord_author(&chat.raw_data);
+                                let locally_banned = is_banned_in_guild(
+                                    bans.bans(),
+                                    &guild,
+                                    &[chat.user_uuid7.as_str(), author_id.as_str(), author_name.as_str()],
+                                );
+                                let passthrough = |processed: String| ContainerForEngine {
+                                    version: 2,
+                                    auth_token: auth_token.clone(),
+                                    module_name: module_name.clone(),
+                                    module_instance_uuid7: instance_uuid.clone(),
+                                    payload: Some(EnginePayload::MessageInProcess(MessageInProcess {
+                                        message_uuid7: uuid.clone(),
+                                        raw_message: Some(chat.clone()),
+                                        processed_message: processed,
+                                        abandon_message: false,
+                                        audio: Vec::new(),
+                                        audio_type: String::new(),
+                                    })),
+                                };
+                                if locally_banned {
+                                    // Local enforcement: skip language checks for
+                                    // a banned sender, pass the text through.
+                                    send_msg(&write_shared, passthrough(process.processed_message.clone())).await;
+                                    continue;
+                                }
+                                if let Some(cmd) = &chat.command {
+                                    if cmd.command_name == BANS_COMMAND {
+                                        let args = strip_command(
+                                            &chat.raw_message,
+                                            &cmd.command_flag,
+                                            &cmd.command_name,
+                                        );
+                                        if let Some(outcome) = handle_bans_command(
+                                            chat, &args, &mut bans, "language-constrainer",
+                                        ) {
+                                            match outcome {
+                                                BanOutcome::Reply(msg) => {
+                                                    send_msg(
+                                                        &write_shared,
+                                                        reply_container(
+                                                            &auth_token, &module_name,
+                                                            &instance_uuid, chat, msg,
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                                BanOutcome::Report(msg, map) => {
+                                                    send_msg(
+                                                        &write_shared,
+                                                        reply_container(
+                                                            &auth_token, &module_name,
+                                                            &instance_uuid, chat, msg,
+                                                        ),
+                                                    )
+                                                    .await;
+                                                    send_msg(
+                                                        &write_shared,
+                                                        bans_report_container(
+                                                            &auth_token, &module_name,
+                                                            &instance_uuid, &map,
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            send_msg(&write_shared, passthrough(process.processed_message.clone())).await;
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
                             // Check the accumulated in-process text from earlier
                             // modules, falling back to the raw message only when
@@ -629,6 +1076,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 })),
                             };
                             send_msg(&write_shared, reply).await;
+                        }
+                        Some(ModulePayload::DatabaseQueryResult(res))
+                            if res.query_id == MODULE_BANS_QUERY =>
+                        {
+                            let report = {
+                                let map = bans.bans();
+                                bans_report_container(
+                                    &auth_token, &module_name, &instance_uuid, map,
+                                )
+                            };
+                            send_msg(&write_shared, report).await;
                         }
                         Some(ModulePayload::Shutdown(_)) => {
                             info!("Engine requested shutdown — exiting");
@@ -1192,5 +1650,82 @@ mod tests {
         assert_eq!(strip_command_token("/me waves"), "waves");
         assert_eq!(strip_command_token("plain"), "plain");
         assert_eq!(strip_command_token("!alone"), "");
+    }
+
+    fn mod_chat(text: &str, guild: &str) -> ChatMessage {
+        ChatMessage {
+            platform: "discord".into(),
+            raw_data: format!(r#"{{"guild_id":"{guild}"}}"#).into_bytes(),
+            raw_message: text.into(),
+            user_uuid7: "mod".into(),
+            command: None,
+            user_data: Some(UserData {
+                uuid: "mod-uuid".into(),
+                username: "mod".into(),
+                is_moderator: true,
+                ..Default::default()
+            }),
+            channel_id: "c".into(),
+        }
+    }
+
+    #[test]
+    fn commands_registration_owns_bans_but_keeps_plain_messages() {
+        let c = commands_registration("!");
+        assert_eq!(c.commands.len(), 1);
+        assert_eq!(c.commands[0].command_name, "language");
+        assert!(c.alert_on_unknown_command);
+    }
+
+    #[test]
+    fn parses_ban_and_unban_subcommands() {
+        assert_eq!(
+            parse_ban_subcommand("ban @bob spam"),
+            Some(BanCmd::Ban {
+                user: "@bob".into(),
+                reason: "spam".into()
+            })
+        );
+        assert_eq!(parse_ban_subcommand("unban bob"), Some(BanCmd::Unban("bob".into())));
+        assert_eq!(parse_ban_subcommand("ban"), None);
+        assert_eq!(parse_ban_subcommand("unban"), None);
+        assert_eq!(normalize_ban_user("@bob"), "bob");
+        assert_eq!(normalize_ban_user("<@!123>"), "123");
+    }
+
+    #[test]
+    fn ban_command_persists_and_enforces_locally() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-lang-{}", uuid::Uuid::now_v7()));
+        let path = dir.join("bans.json");
+        let mut store = BanStore::new(path.to_string_lossy().as_ref());
+        let chat = mod_chat("!language ban @badguy spam", "guild1");
+        match handle_bans_command(&chat, "ban @badguy spam", &mut store, "language-constrainer").unwrap() {
+            BanOutcome::Report(msg, map) => {
+                assert!(msg.contains("Banned `badguy`"));
+                assert_eq!(all_ban_ids(&map), vec!["badguy".to_string()]);
+            }
+            BanOutcome::Reply(m) => panic!("unexpected reply: {m}"),
+        }
+        let map = load_bans(store.path());
+        assert_eq!(map["guild1"]["badguy"].by, "mod-uuid");
+        assert!(is_banned_in_guild(store.bans(), "guild1", &["badguy"]));
+        assert!(!is_banned_in_guild(store.bans(), "guild2", &["badguy"]));
+
+        let mut norm = mod_chat("!language ban @other", "guild1");
+        norm.user_data = Some(UserData {
+            uuid: "u".into(),
+            username: "someone".into(),
+            ..Default::default()
+        });
+        match handle_bans_command(&norm, "ban @other", &mut store, "language-constrainer").unwrap() {
+            BanOutcome::Reply(msg) => assert!(msg.contains("Only moderators")),
+            _ => panic!("non-mod must not ban"),
+        }
+        match handle_bans_command(&chat, "unban badguy", &mut store, "language-constrainer").unwrap() {
+            BanOutcome::Report(msg, _) => assert!(msg.contains("Unbanned `badguy`")),
+            BanOutcome::Reply(m) => panic!("unexpected reply: {m}"),
+        }
+        assert!(!load_bans(store.path()).contains_key("guild1"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

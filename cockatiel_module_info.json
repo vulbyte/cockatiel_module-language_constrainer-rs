@@ -70,6 +70,24 @@
       "label": "Min detection confidence (0-1)",
       "list": false,
       "sensitive": false
+    },
+    {
+      "key": "command_flag",
+      "label": "Command Flag",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "data_dir",
+      "label": "Data directory",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "bans_path",
+      "label": "Bans file (bans.json)",
+      "list": false,
+      "sensitive": false
     }
   ],
   "description": "constrains chat to a target language; out-of-language messages are held for audit (a moderator must approve/reject them)",
